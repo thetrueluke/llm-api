@@ -5,5 +5,5 @@ services:
       dockerfile: Dockerfile
     image: qwen-webapi:cpu
     ports:
-      - "8000:8000"
+      - "80:8000"
     # environment:
