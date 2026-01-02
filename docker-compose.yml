@@ -1,0 +1,9 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: qwen-webapi:cpu
+    ports:
+      - "8000:8000"
+    # environment:

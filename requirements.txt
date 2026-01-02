@@ -1,0 +1,4 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.0
+transformers==4.57.3
+accelerate==0.34.2
