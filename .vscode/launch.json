@@ -1,0 +1,25 @@
+
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "FastAPI (Uvicorn)",
+      "type": "python",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": [
+        "app:app",
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--log-level", "info"
+      ],
+      "console": "integratedTerminal",
+      "env": {
+        "MODEL_ID": "Qwen/Qwen2.5-7B-Instruct",
+        "LOG_LEVEL": "INFO"
+      },
+      "jinja": true,
+           "justMyCode": true
+    }
+  ]
+}
