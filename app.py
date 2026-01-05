@@ -1,4 +1,3 @@
-
 import os
 import time
 import logging
@@ -7,12 +6,12 @@ import asyncio
 import contextlib
 import re
 import json
-from typing import Callable, Tuple, Optional
+from typing import Callable, Tuple, Optional, List
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # -----------------------------------------------------------------------------
 # Logging configuration
@@ -43,7 +42,19 @@ SYSTEM_PROMPT_PATH = os.getenv("SYSTEM_PROMPT_PATH", "prompts/system_classifier.
 # FastAPI app
 # -----------------------------------------------------------------------------
 logger.info("Initializing API")
-app = FastAPI(title="LLM WebAPI", version="1.0")
+app = FastAPI(
+    title="LLM WebAPI",
+    version="1.1",
+    description=(
+        "REST API for a background-loaded LLM classifier.\n\n"
+        "Use /health to check readiness and /classify to perform JSON classification."
+    ),
+    docs_url="/docs",       # Swagger UI
+    redoc_url="/redoc",     # ReDoc
+    openapi_url="/openapi.json"
+    #lifespan=lifespan
+)
+
 
 
 def _load_models_blocking(model_id: str, device: str) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
@@ -130,6 +141,19 @@ app.router.lifespan_context = lifespan  # register lifespan
 class AskRequest(BaseModel):
     question: str
 
+class HealthResponse(BaseModel):
+    ready: bool = Field(..., description="True if model is ready, else False.")
+    model: str = Field(..., description="Model identifier.")
+    device: str = Field(..., description="Execution device, e.g., 'cuda' or 'cpu'.")
+    error: Optional[str] = Field(None, description="Startup error if any, else null.")
+
+class ClassificationResponse(BaseModel):
+    is_description_type: bool = Field(..., description="Whether the input looks like a description.")
+    type: str = Field(..., description="Predicted category (e.g., 'product').")
+    confidence: float = Field(..., ge=0, le=1, description="Confidence score in [0,1].")
+    rationale: str = Field(..., description="Brief reasoning for the classification.")
+    key_signals: List[str] = Field(..., description="Salient cues or ")
+
 
 def build_prompt(user_question: str) -> str:
     return f"### Question:\n{user_question}\n\n### Answer:\n"
@@ -174,18 +198,22 @@ async def log_requests(request: Request, call_next: Callable):
 # -----------------------------------------------------------------------------
 # Endpoints
 # -----------------------------------------------------------------------------
-@app.get("/health")
+@app.get("/health",
+         response_model=HealthResponse,
+         tags=["health"],
+         summary="Health (liveness & readiness)",
+         description="Returns readiness status and environment info. Always HTTP 200.")
 def health():
     """
     Liveness + readiness snapshot. Always 200 so liveness checks pass.
     Clients can inspect 'ready'=='True' to decide if they can call /classify.
     """
-    return {
-        "ready": getattr(app.state, "ready", False),
-        "model": MODEL_ID,
-        "device": DEVICE,
-        "error": getattr(app.state, "startup_error", None),
-    }
+    return HealthResponse(
+        ready=getattr(app.state, "ready", False),
+        model=MODEL_ID,
+        device=DEVICE,
+        error=getattr(app.state, "startup_error", None)
+    )
 
 
 @app.get("/classify")
@@ -194,7 +222,14 @@ def classify_get(question: str = Query(..., min_length=1)):
     return classify(AskRequest(question=question))
 
 
-@app.post("/classify")
+@app.post("/classify",
+          response_model=ClassificationResponse,
+          tags=["classification"],
+          summary="Classify (POST)",
+          description=(
+              "Classifies the input text and returns a strict JSON schema with "
+              "type, confidence, rationale, and key signals."
+          ))
 def classify(body: AskRequest):
     # Ensure model is ready
     if not getattr(app.state, "ready", False):
