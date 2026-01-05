@@ -2,41 +2,166 @@ import os
 import time
 import logging
 import traceback
-from typing import Callable
+import asyncio
+import contextlib
+import re
+import json
+from typing import Callable, Tuple, Optional, List
 
-# -----------------------
-# Logging configuration
-# -----------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-
-# -----------------------
-# FastAPI
-# -----------------------
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+# -----------------------------------------------------------------------------
+# Logging configuration
+# -----------------------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, datefmt=DATE_FORMAT)
-logger = logging.getLogger("qwen-webapi")
+logger = logging.getLogger("llm-webapi")
 
-logger.info("Initializing API")
-app = FastAPI(title="Qwen2.5-7B WebAPI", version="1.0")
+# -----------------------------------------------------------------------------
+# Model/config constants (after torch import)
+# -----------------------------------------------------------------------------
+try:
+    import torch
+except Exception:
+    # Provide a clear error early if torch isn't available
+    raise RuntimeError("PyTorch must be installed to run this service.")
 
-# -----------------------
-# App & model globals
-# -----------------------
-logger.info("Importing transformers")
-from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
 
 MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-7B")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SYSTEM_PROMPT_PATH = os.getenv("SYSTEM_PROMPT_PATH", "prompts/system_classifier.txt")
 
-# -----------------------
+# -----------------------------------------------------------------------------
+# FastAPI app
+# -----------------------------------------------------------------------------
+logger.info("Initializing API")
+app = FastAPI(
+    title="LLM WebAPI",
+    version="1.1",
+    description=(
+        "REST API for a background-loaded LLM classifier.\n\n"
+        "Use /health to check readiness and /classify to perform JSON classification."
+    ),
+    docs_url="/docs",       # Swagger UI
+    redoc_url="/redoc",     # ReDoc
+    openapi_url="/openapi.json"
+    #lifespan=lifespan
+)
+
+
+
+def _load_models_blocking(model_id: str, device: str) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
+    """Load tokenizer and model in a worker thread so it doesn't block the event loop."""
+    t0 = time.perf_counter()
+    logger.info(f"[startup] Loading tokenizer: {model_id}")
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    logger.info(f"[startup] Loading model: {model_id} (dtype={dtype}, device={device})")
+
+    # 'dtype' is the modern arg name (instead of deprecated torch_dtype)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        dtype=dtype,
+        device_map="auto" if device == "cuda" else None,
+    )
+    if device != "cuda":
+        model.to(device)
+    model.eval()
+
+    t_ms = (time.perf_counter() - t0) * 1000
+    logger.info(f"[startup] Model+tokenizer ready in {t_ms:.1f} ms")
+    return tokenizer, model
+
+
+async def _background_model_loader(app: FastAPI) -> None:
+    """Background task that loads the Transformers stack and flips readiness to True."""
+    try:
+        tok, mdl = await asyncio.to_thread(_load_models_blocking, MODEL_ID, DEVICE)
+        # Publish to app.state (shared app-wide state)
+        app.state.tokenizer = tok
+        app.state.model = mdl
+        app.state.ready = True
+        logger.info("[startup] Readiness set to True")
+    except Exception:
+        app.state.ready = False
+        app.state.startup_error = traceback.format_exc()
+        logger.error("[startup] Model load failed:\n%s", app.state.startup_error)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize state quickly (so the server becomes responsive immediately)
+    app.state.ready: bool = False
+    app.state.startup_error: Optional[str] = None
+    app.state.tokenizer: Optional[AutoTokenizer] = None
+    app.state.model: Optional[AutoModelForCausalLM] = None
+
+    # Load system prompt once
+    try:
+        with open(SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as f:
+            app.state.system_text = f.read()
+        logger.info(
+            f"[startup] Loaded system prompt from {SYSTEM_PROMPT_PATH} ({len(app.state.system_text)} chars)"
+        )
+    except Exception as e:
+        app.state.system_text = (
+            "You are a strict JSON classifier. Output ONLY JSON with the required keys."
+        )
+        app.state.startup_error = f"Failed to read SYSTEM_PROMPT_PATH: {e}"
+        logger.warning(f"[startup] Using fallback system prompt. Error: {e}")
+
+    # Fire-and-forget background loading (non-blocking)
+    app.state.model_task = asyncio.create_task(_background_model_loader(app))
+
+    # Yield immediately: startup completes, app starts serving
+    yield
+
+    # Shutdown: cancel background task if still running
+    task = getattr(app.state, "model_task", None)
+    if task and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+app.router.lifespan_context = lifespan  # register lifespan
+
+
+# -----------------------------------------------------------------------------
+# Schemas & helpers
+# -----------------------------------------------------------------------------
+class AskRequest(BaseModel):
+    question: str
+
+class HealthResponse(BaseModel):
+    ready: bool = Field(..., description="True if model is ready, else False.")
+    model: str = Field(..., description="Model identifier.")
+    device: str = Field(..., description="Execution device, e.g., 'cuda' or 'cpu'.")
+    error: Optional[str] = Field(None, description="Startup error if any, else null.")
+
+class ClassificationResponse(BaseModel):
+    is_description_type: bool = Field(..., description="Whether the input looks like a description.")
+    type: str = Field(..., description="Predicted category (e.g., 'product').")
+    confidence: float = Field(..., ge=0, le=1, description="Confidence score in [0,1].")
+    rationale: str = Field(..., description="Brief reasoning for the classification.")
+    key_signals: List[str] = Field(..., description="Salient cues or ")
+
+
+def build_prompt(user_question: str) -> str:
+    return f"### Question:\n{user_question}\n\n### Answer:\n"
+
+
+# -----------------------------------------------------------------------------
 # Request logging middleware
-# -----------------------
+# -----------------------------------------------------------------------------
 @app.middleware("http")
 async def log_requests(request: Request, call_next: Callable):
     start = time.perf_counter()
@@ -45,9 +170,8 @@ async def log_requests(request: Request, call_next: Callable):
     path = request.url.path
     query = str(request.query_params) if request.query_params else ""
     body_preview = ""
-
     try:
-        if (path == "/ask" or "/classify") and method == "POST":
+        if path in ("/ask", "/classify") and method == "POST":
             body_bytes = await request.body()
             body_preview = body_bytes.decode("utf-8", errors="ignore")
             if len(body_preview) > 500:
@@ -57,7 +181,7 @@ async def log_requests(request: Request, call_next: Callable):
 
     logger.info(f">>> {client_ip} {method} {path} {('?' + query) if query else ''}")
     if body_preview:
-        logger.info(f"    body: {body_preview}")
+        logger.info(f" body: {body_preview}")
 
     try:
         response: Response = await call_next(request)
@@ -71,105 +195,25 @@ async def log_requests(request: Request, call_next: Callable):
         return JSONResponse(status_code=500, content={"detail": f"Unhandled server error: {type(e).__name__}"})
 
 
-# -----------------------
-# Model initialization
-# -----------------------
-try:
-    logger.info(f"Initializing model: {MODEL_ID}")
-    logger.info(f"Detected device: {DEVICE} (cuda_available={torch.cuda.is_available()})")
-
-    t0 = time.perf_counter()
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    t_tok = (time.perf_counter() - t0) * 1000
-    logger.info(f"Tokenizer loaded in {t_tok:.1f} ms")
-
-    dtype = torch.float16 if DEVICE == "cuda" else torch.float32
-    logger.info(f"Selected dtype: {dtype}")
-
-    t1 = time.perf_counter()
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        torch_dtype=dtype,
-        device_map="auto" if DEVICE == "cuda" else None
-    )
-    if DEVICE != "cuda":
-        model.to(DEVICE)
-    t_model = (time.perf_counter() - t1) * 1000
-    t_total = (time.perf_counter() - t0) * 1000
-    logger.info(f"Model loaded in {t_model:.1f} ms (total init {t_total:.1f} ms)")
-except Exception as e:
-    logger.error(f"Failed to load model {MODEL_ID}: {e}")
-    logger.error(traceback.format_exc())
-    raise RuntimeError(f"Failed to load model {MODEL_ID}: {e}")
-
-
-# -----------------------
-# Schemas & helpers
-# -----------------------
-class AskRequest(BaseModel):
-    question: str
-
-
-def build_prompt(user_question: str) -> str:
-    return f"### Question:\n{user_question}\n\n### Answer:\n"
-
-
-# -----------------------
+# -----------------------------------------------------------------------------
 # Endpoints
-# -----------------------
-@app.get("/health")
+# -----------------------------------------------------------------------------
+@app.get("/health",
+         response_model=HealthResponse,
+         tags=["health"],
+         summary="Health (liveness & readiness)",
+         description="Returns readiness status and environment info. Always HTTP 200.")
 def health():
-    logger.debug("Health check invoked")
-    return {"status": "ok", "model": MODEL_ID, "device": DEVICE}
-
-
-@app.get("/ask")
-def ask_get(question: str = Query(..., min_length=1)):
-    logger.debug("GET /ask invoked")
-    return ask(AskRequest(question=question))
-
-@app.post("/ask")
-def ask(body: AskRequest):
-    logger.debug("POST /ask invoked")
-    question = (body.question or "").strip()
-    if not question:
-        logger.warning("Validation failed: empty question")
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
-    prompt = build_prompt(question)
-    gen_kwargs = {
-        "max_new_tokens": 256,
-        "temperature": 0.7,
-        "top_p": 0.9,
-        "do_sample": True,
-        "eos_token_id": tokenizer.eos_token_id,
-        "pad_token_id": tokenizer.eos_token_id,
-    }
-
-    try:
-        t0 = time.perf_counter()
-        inputs = tokenizer(prompt, return_tensors="pt")
-        prompt_len = inputs["input_ids"].shape[-1]
-        inputs = inputs.to(DEVICE)
-
-        with torch.no_grad():
-            output_ids = model.generate(**inputs, **gen_kwargs)
-
-        gen_ms = (time.perf_counter() - t0) * 1000
-        total_ids = output_ids.shape[-1]
-        new_tokens = total_ids - prompt_len
-
-        full_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        answer = full_text.split("### Answer:")[-1].strip()
-
-        logger.info(
-            f"Generation ok | prompt_tokens={prompt_len} "
-            f"new_tokens={new_tokens} total_tokens={total_ids} time_ms={gen_ms:.1f}"
-        )
-        return {"question": question, "answer": answer, "model": MODEL_ID}
-    except Exception as e:
-        logger.error(f"Inference error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Inference error: {e}")
+    """
+    Liveness + readiness snapshot. Always 200 so liveness checks pass.
+    Clients can inspect 'ready'=='True' to decide if they can call /classify.
+    """
+    return HealthResponse(
+        ready=getattr(app.state, "ready", False),
+        model=MODEL_ID,
+        device=DEVICE,
+        error=getattr(app.state, "startup_error", None)
+    )
 
 
 @app.get("/classify")
@@ -177,69 +221,62 @@ def classify_get(question: str = Query(..., min_length=1)):
     logger.debug("GET /classify invoked")
     return classify(AskRequest(question=question))
 
-@app.post("/classify")
+
+@app.post("/classify",
+          response_model=ClassificationResponse,
+          tags=["classification"],
+          summary="Classify (POST)",
+          description=(
+              "Classifies the input text and returns a strict JSON schema with "
+              "type, confidence, rationale, and key signals."
+          ))
 def classify(body: AskRequest):
+    # Ensure model is ready
+    if not getattr(app.state, "ready", False):
+        raise HTTPException(status_code=503, detail="Model is still loading. Try again shortly.")
+
+    tokenizer: AutoTokenizer = app.state.tokenizer
+    model: AutoModelForCausalLM = app.state.model
+    system_text: str = getattr(app.state, "system_text", "")
+
     question = (body.question or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    system_text = """
-You are a strict JSON classifier. 
-Your task: decide whether the user input is a *description* and, if so, classify its type.
-
-Definitions:
-- "Description": A text primarily conveying attributes, characteristics, properties, or details about a subject (e.g., product features, person bio, process steps, place details, event overview, error message explanation). It is not asking a question, not issuing an instruction, and not general chit-chat.
-- Types (choose one):
-  product   - describes a product/service (features, specs, benefits)
-  process   - describes steps, workflows, procedures
-  person    - biography, role, achievements, traits
-  place     - location, facilities, environment, geography
-  event     - occurrence, schedule, agenda, outcomes
-  error     - error/issue description, stack trace, incident symptom
-  other     - descriptive but doesn't fit above
-
-Output requirements:
-- Respond ONLY with JSON following this schema:
-  {
-    "is_description_type": boolean,
-    "type": "product|process|person|place|event|error|other",
-    "confidence": number,
-    "rationale": "string",
-    "key_signals": ["string", "string"]
-  }
-- Do NOT include any text outside JSON. No markdown, no commentary.
-
-Edge cases:
-- If the input is a single noun phrase or bullet list that still conveys attributes, treat it as description.
-- If the input mixes question + description, prefer description if ~70% of tokens are descriptive.
-- If it is command/instruction (imperatives), set is_description_type=false.
-
-"""
-
+    # Build messages for chat template (few-shot included)
     messages = [
         {"role": "system", "content": system_text},
-        # Include the few-shot pairs BEFORE the real input if you want stronger guidance:
-        {"role": "user", "content": "Lightweight trail-running shoes with breathable mesh, rock plate, 4mm drop, and Vibram outsole for wet terrain."},
-        {"role": "assistant", "content": '''{
-            "is_description_type": true,
-            "type": "product",
-            "confidence": 0.92,
-            "rationale": "Lists product features and specifications.",
-            "key_signals": ["feature list", "materials", "technical terms (drop, outsole)"]
-        }'''},
-        # ... add other examples ...
+        # Few-shot guidance example
+        {
+            "role": "user",
+            "content": "Lightweight trail-running shoes with breathable mesh, rock plate, 4mm drop, and Vibram outsole for wet terrain.",
+        },
+        {
+            "role": "assistant",
+            "content": """{
+                "is_description_type": true,
+                "type": "product",
+                "confidence": 0.92,
+                "rationale": "Lists product features and specifications.",
+                "key_signals": ["feature list", "materials", "technical terms (drop, outsole)"]
+            }""",
+        },
+        # Actual input
         {"role": "user", "content": question},
     ]
 
-    prompt_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    # Prefer tokenizer.apply_chat_template if available
+    if hasattr(tokenizer, "apply_chat_template"):
+        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    else:
+        # Fallback: simple system + user concatenation
+        prompt_text = (system_text or "") + "\n" + build_prompt(question)
 
     inputs = tokenizer([prompt_text], return_tensors="pt", truncation=True, max_length=4096).to(model.device)
 
     gen_kwargs = {
-        "max_new_tokens": 256,      # plenty for the JSON
-        "temperature": 0.0,         # deterministic classification
+        "max_new_tokens": 256,  # plenty for the JSON
+        "temperature": 0.0,     # deterministic classification
         "top_p": 1.0,
         "do_sample": False,
         "eos_token_id": tokenizer.eos_token_id,
@@ -254,9 +291,12 @@ Edge cases:
     raw = tokenizer.decode(new_token_ids, skip_special_tokens=True).strip()
 
     # Harden: trim anything before/after JSON braces
-    import re, json
     m = re.search(r'\{.*\}', raw, flags=re.S)
     if not m:
         raise HTTPException(status_code=422, detail="Model did not return valid JSON.")
-    payload = json.loads(m.group(0))
+    try:
+        payload = json.loads(m.group(0))
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON from model: {e}")
+
     return payload
