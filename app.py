@@ -246,22 +246,37 @@ def classify(body: AskRequest):
     # Build messages for chat template (few-shot included)
     messages = [
         {"role": "system", "content": system_text},
-        # Few-shot guidance example
+        # Przykład few-shot (opis szkody)
         {
             "role": "user",
-            "content": "Lightweight trail-running shoes with breathable mesh, rock plate, 4mm drop, and Vibram outsole for wet terrain.",
+            "content": "Zalało mi mieszkanie po awarii pralki, woda rozlała się po całym przedpokoju i salonie.",
         },
         {
             "role": "assistant",
             "content": """{
                 "is_description_type": true,
-                "type": "product",
-                "confidence": 0.92,
-                "rationale": "Lists product features and specifications.",
-                "key_signals": ["feature list", "materials", "technical terms (drop, outsole)"]
+                "type": "zalanie",
+                "confidence": 0.95,
+                "rationale": "Opisuje zdarzenie związane z wodą i zalaniem pomieszczeń.",
+                "key_signals": ["zalało", "woda", "awaria pralki"]
             }""",
         },
-        # Actual input
+        # Przykład negatywny (nie jest opisem szkody)
+        {
+            "role": "user",
+            "content": "Czy mogę zgłosić szkodę przez aplikację mobilną?",
+        },
+        {
+            "role": "assistant",
+            "content": """{
+                "is_description_type": false,
+                "type": "other",
+                "confidence": 0.99,
+                "rationale": "To jest pytanie, a nie opis zdarzenia.",
+                "key_signals": ["czy mogę", "zgłosić", "pytanie"]
+            }""",
+        },
+        # Faktyczne wejście użytkownika
         {"role": "user", "content": question},
     ]
 
