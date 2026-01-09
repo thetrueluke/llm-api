@@ -14,10 +14,7 @@
         "--log-level", "info"
       ],
       "console": "integratedTerminal",
-      "env": {
-        "MODEL_ID": "Qwen/Qwen2.5-7B-Instruct",
-        "LOG_LEVEL": "INFO"
-      },
+      "envFile": "${workspaceFolder}/.env",
       "jinja": true,
            "justMyCode": true
     }

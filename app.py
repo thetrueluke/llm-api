@@ -9,7 +9,7 @@ import json
 from typing import Callable, Tuple, Optional, List
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Query, HTTPException, Request, Response
+from fastapi import FastAPI, Query, HTTPException, Request, Response, Depends, Header, Security
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -37,6 +37,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-7B")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SYSTEM_PROMPT_PATH = os.getenv("SYSTEM_PROMPT_PATH", "prompts/system_classifier.txt")
+FEWSHOTS_PATH = os.getenv("FEWSHOTS_PATH", "prompts/fewshots.json")
+
+# -----------------------------------------------------------------------------
+# Authorization config
+# -----------------------------------------------------------------------------
+API_SECRET = os.getenv("API_SECRET", "").strip()
+API_KEY_HEADER_NAME = "X-Api-Key"
 
 # -----------------------------------------------------------------------------
 # FastAPI app
@@ -55,6 +62,28 @@ app = FastAPI(
     #lifespan=lifespan
 )
 
+class UnauthorizedError(HTTPException):
+    def __init__(self, detail="Unauthorized"):
+        super().__init__(status_code=401, detail=detail, headers={"WWW-Authenticate": "API-Key"})
+
+def require_api_key(
+    x_api_key: str | None = Header(default=None, alias=API_KEY_HEADER_NAME, description="Shared secret API key")
+) -> str:
+    """
+    Accept API key from custom header X-Api-Key.
+    """
+
+    if not API_SECRET:
+        return None
+    provided = (x_api_key or "").strip()
+    if not provided:
+        raise UnauthorizedError(f"Missing {API_KEY_HEADER_NAME} header")
+    if provided != API_SECRET:
+        raise UnauthorizedError("Invalid API key")
+    return provided
+
+# Global dependency for all routes:
+# app.dependencies = [Depends(get_api_key)]
 
 
 def _load_models_blocking(model_id: str, device: str) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
@@ -89,7 +118,7 @@ async def _background_model_loader(app: FastAPI) -> None:
         app.state.tokenizer = tok
         app.state.model = mdl
         app.state.ready = True
-        logger.info("[startup] Readiness set to True")
+        logger.info("[startup] Ready for action!")
     except Exception:
         app.state.ready = False
         app.state.startup_error = traceback.format_exc()
@@ -131,9 +160,19 @@ async def lifespan(app: FastAPI):
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
+def load_fewshots(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            fewshotsdata = json.load(f)
+            logger.info(f"[startup] Loaded few-shots from {path}: {len(fewshotsdata)} items")
+            return fewshotsdata
+    except Exception as e:
+        logger.warning(f"Failed to load few-shots from {path}: {e}")
+        return []
 
 app.router.lifespan_context = lifespan  # register lifespan
 
+fewshots = load_fewshots(FEWSHOTS_PATH)
 
 # -----------------------------------------------------------------------------
 # Schemas & helpers
@@ -153,7 +192,6 @@ class ClassificationResponse(BaseModel):
     confidence: float = Field(..., ge=0, le=1, description="Confidence score in [0,1].")
     rationale: str = Field(..., description="Brief reasoning for the classification.")
     key_signals: List[str] = Field(..., description="Salient cues or ")
-
 
 def build_prompt(user_question: str) -> str:
     return f"### Question:\n{user_question}\n\n### Answer:\n"
@@ -216,13 +254,22 @@ def health():
     )
 
 
-@app.get("/classify")
+@app.get("/classify",
+         dependencies=[Security(require_api_key)],
+         response_model=ClassificationResponse,
+         tags=["classification"],
+         summary="Classify (GET)",
+         description=(
+             "Classifies the input text and returns a strict JSON schema with "
+             "type, confidence, rationale, and key signals."
+         ))
 def classify_get(question: str = Query(..., min_length=1)):
     logger.debug("GET /classify invoked")
     return classify(AskRequest(question=question))
 
 
 @app.post("/classify",
+          dependencies=[Security(require_api_key)],
           response_model=ClassificationResponse,
           tags=["classification"],
           summary="Classify (POST)",
@@ -243,41 +290,13 @@ def classify(body: AskRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
+    #logger.debug(f"System text: {system_text}")
+
     # Build messages for chat template (few-shot included)
     messages = [
         {"role": "system", "content": system_text},
-        # Przykład few-shot (opis szkody)
-        {
-            "role": "user",
-            "content": "Zalało mi mieszkanie po awarii pralki, woda rozlała się po całym przedpokoju i salonie.",
-        },
-        {
-            "role": "assistant",
-            "content": """{
-                "is_description_type": true,
-                "type": "zalanie",
-                "confidence": 0.95,
-                "rationale": "Opisuje zdarzenie związane z wodą i zalaniem pomieszczeń.",
-                "key_signals": ["zalało", "woda", "awaria pralki"]
-            }""",
-        },
-        # Przykład negatywny (nie jest opisem szkody)
-        {
-            "role": "user",
-            "content": "Czy mogę zgłosić szkodę przez aplikację mobilną?",
-        },
-        {
-            "role": "assistant",
-            "content": """{
-                "is_description_type": false,
-                "type": "other",
-                "confidence": 0.99,
-                "rationale": "To jest pytanie, a nie opis zdarzenia.",
-                "key_signals": ["czy mogę", "zgłosić", "pytanie"]
-            }""",
-        },
-        # Faktyczne wejście użytkownika
-        {"role": "user", "content": question},
+        *fewshots,
+        {"role": "user", "content": question},  # Actual user input
     ]
 
     # Prefer tokenizer.apply_chat_template if available
@@ -304,14 +323,18 @@ def classify(body: AskRequest):
     # Decode only newly generated tokens
     new_token_ids = output_ids[0, inputs.input_ids.shape[-1]:]
     raw = tokenizer.decode(new_token_ids, skip_special_tokens=True).strip()
+    logger.debug(f"Raw response from model:\n{raw}")
 
     # Harden: trim anything before/after JSON braces
-    m = re.search(r'\{.*\}', raw, flags=re.S)
-    if not m:
+    jsonCandidate = re.search(r'\{.*\}', raw, flags=re.S)
+
+    if not jsonCandidate:
         raise HTTPException(status_code=422, detail="Model did not return valid JSON.")
     try:
-        payload = json.loads(m.group(0))
+        payload = json.loads(jsonCandidate.group(0))
     except json.JSONDecodeError as e:
+        logger.debug(f"JSON candidate from response:\n{jsonCandidate.group(0)}")
         raise HTTPException(status_code=422, detail=f"Invalid JSON from model: {e}")
 
+    logger.debug(f"JSON response:\n{payload}")
     return payload

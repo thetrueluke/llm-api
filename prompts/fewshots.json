@@ -1,0 +1,19 @@
+
+[
+  {
+    "role": "user",
+    "content": "Zalało mi mieszkanie po awarii pralki, woda rozlała się po całym przedpokoju i salonie."
+  },
+  {
+    "role": "assistant",
+    "content": "{\n  \"is_description_type\": true,\n  \"type\": \"zalanie\",\n  \"confidence\": 0.95,\n  \"rationale\": \"Opisuje zdarzenie związane z wodą i zalaniem pomieszczeń.\",\n  \"key_signals\": [\"zalało\", \"woda\", \"awaria pralki\"]\n}"
+  },
+  {
+    "role": "user",
+    "content": "Czy mogę zgłosić szkodę przez aplikację mobilną?"
+  },
+  {
+    "role": "assistant",
+    "content": "{\n  \"is_description_type\": false,\n  \"type\": \"other\",\n  \"confidence\": 0.99,\n  \"rationale\": \"To jest pytanie, a nie opis zdarzenia.\",\n  \"key_signals\": [\"czy mogę\", \"zgłosić\", \"pytanie\"]\n}"
+  }
+]
